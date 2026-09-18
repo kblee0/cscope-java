@@ -28,7 +28,7 @@ application {
     mainClass = 'io.cscope.java.JdtProjectAnalyzerMain'
 }
 
-tasks.withType(JavaCompile) {
+tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 

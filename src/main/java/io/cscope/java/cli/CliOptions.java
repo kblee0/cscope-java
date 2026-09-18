@@ -1,6 +1,5 @@
 package io.cscope.java.cli;
 
-import java.util.Arrays;
 import java.util.List;
 
 public class CliOptions {

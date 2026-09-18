@@ -66,7 +66,6 @@ public class ExtendedJdtMetricsVisitor extends ASTVisitor {
         ITypeBinding binding = node.resolveBinding();
         if (binding == null) return true;
 
-        TypeDeclaration parentClass = currentClass;
         currentClass = node;
 
         String className = node.getName().getIdentifier();
