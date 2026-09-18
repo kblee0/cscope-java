@@ -1,99 +1,114 @@
+# cscope-java
+
+Eclipse JDT ASTParser 기반 Java 정적 분석기. 프로젝트를 파싱해 LoC / Cyclomatic Complexity / Call Graph 를 추출하고,
+DB 5개 테이블과 1:1 대응하는 CSV 5개를 생성한다. (Bulk Import 전용 산출물)
+
+## 1. 빌드
+
 ```
-cscope-java/
-├── build.gradle (Gradle 빌드 설정, JDT 및 Commons CSV 의존성 포함)
-├── schema.sql (DB 테이블 DDL 및 Bulk Import 예시 쿼리)
-└── src/main/java/io/cscope/java/
-    ├── JdtProjectAnalyzerMain.java (CLI 실행 메인 클래스)
-    ├── cli/
-    │   ├── CliOptions.java (CLI 옵션 저장)
-    │   └── CliOptionsParser.java (인수 파싱 로직)
-    ├── config/
-    │   ├── AnalyzerConfig.java (분석 환경 설정)
-    │   └── PackageFilter.java (Include/Exclude 패키지 필터)
-    ├── dto/
-    │   ├── ProjectDto.java
-    │   ├── FileMetricDto.java
-    │   ├── ClassMetricDto.java
-    │   ├── MethodMetricDto.java
-    │   └── CallGraphDto.java
-    ├── export/
-    │   ├── CsvExportService.java (CSV 파일 생성 및 쓰기)
-    │   └── CsvRowMapper.java (데이터 행 매핑 정의)
-    ├── parser/
-    │   ├── CyclomaticComplexityVisitor.java (순환 복잡도 계산 엔진)
-    │   ├── ExtendedJdtMetricsVisitor.java (AST 기반 메트릭/호출 추출)
-    │   └── JdtParserFactory.java (ASTParser 설정 및 생성)
-    ├── service/
-    │   ├── CallGraphResolver.java (Callee ID 및 Target Type 확인)
-    │   ├── MetricAggregator.java (Fan-in/out 및 가중 복잡도 연산)
-    │   └── ProjectAnalyzerService.java (분석 프로세스 총괄)
-    └── util/
-        ├── LineNumberUtils.java (LoC 및 라인 번호 유틸)
-        └── SourceIdBuilder.java (Natural Business Key 생성기)
+gradle jar
 ```
-  구현 핵심 요약
-   1. ID 체계: SourceIdBuilder를 통해 package.class.method(params) 형태의 문자열 자연 키를 생성하여 DB Join 및 분석
-      용이성을 극대화했습니다.
-   2. 순환 복잡도: CyclomaticComplexityVisitor가 If, For, While, Catch, SwitchCase, &&/|| 등을 추적하여 표준
-      계산법(Nodes + 1)을 적용합니다.
-   3. 인메모리 후처리: ProjectAnalyzerService에서 1차 파싱 후 CallGraphResolver와 MetricAggregator를 호출하여 전체
-      프로젝트 맥락에서의 Fan-in, Fan-out, 가중 복잡도를 산출합니다.
-   4. CSV 매핑: CsvExportService는 생성된 DTO 리스트를 schema.sql 정의와 100% 일치하는 헤더와 데이터 구조로 출력합니다.
-   
-  2. 분석 실행 (Run)
-  CLI 옵션을 사용하여 대상 Java 프로젝트를 분석합니다.
 
-  기본 실행 예시
+`build/libs/cscope-java.jar` (의존성 포함 실행 가능 Jar) 가 생성된다. JDK 17 이상 필요.
 
-   1 java -jar build/libs/cscope-java-1.0-SNAPSHOT.jar \
-   2   --project "my-awesome-app" \
-   3   --source "C:/path/to/your/java/project/src/main/java" \
-   4   --output "./analysis_results"
+## 2. 실행
 
-  옵션 상세 설명
-  | 옵션      | 필수 여부 | 설명                                      | 예시                                        |
-  | --------- | --------- | ----------------------------------------- | ------------------------------------------- |
-  | --project | 필수      | 프로젝트 고유 식별자 (DB의 project_id)    | erp-system                                  |
-  | --source  | 필수      | 분석할 Java 소스 코드가 있는 최상위 경로  | /home/dev/src                               |
-  | --output  | 선택      | CSV 파일이 저장될 폴더 (기본값: ./output) | ./results                                   |
-  | --include | 선택      | 분석 대상 패키지 접두사 (콤마 구분)       | com.mycompany                               |
-  | --exclude | 선택      | 분석 제외 패키지 접두사 (콤마 구분)       | com.mycompany.test                          |
-  | --libs    | 선택      | Class Path                                | a.jar;/home/dev/prj/build/classes/java/main |
-  
----
+```
+Usage: java -jar cscope-java.jar -p <project id> -s <path> [-l <jar_dir_or_file>] [-o <output path>] [-i <pkg1,pkg2>] [-e <pkg1,pkg2>]
 
-  3. 결과 확인 (Output)
-  실행이 완료되면 지정한 --output 폴더에 다음 5개 파일이 생성됩니다.
+  -p  project_id (필수). 예: my-app
+  -s  분석 대상 소스 루트 디렉터리 (필수). file_path 의 기준 경로(package_path)가 된다.
+  -l  의존 라이브러리 Jar 디렉터리 또는 Jar 파일 (선택)
+  -o  CSV 출력 디렉터리 (선택, 기본 ./output)
+  -i  수집 대상 패키지 prefix 목록, 콤마 구분 (선택)
+  -e  제외 패키지 prefix 목록, 콤마 구분 (선택)
+  -h  도움말
+```
 
-   1. project.csv: 프로젝트 요약 메트릭
-   2. file_metric.csv: 파일 단위 LoC 및 통계
-   3. class_metric.csv: 클래스 타입 및 복잡도 통계
-   4. method_metric.csv: 메서드 시그니처, 복잡도, Fan-in/out
-   5. call_graph.csv: 메서드 간 호출 관계 (Internal/Library 구분)
+예시
 
-  ---
+```
+java -jar cscope-java.jar -p my-app -s /work/my-app/src/main/java -l /work/my-app/libs -o ./output -i com.home -e com.home.legacy
+```
 
-  4. DB 데이터 임포트 (Bulk Import)
-  생성된 CSV 파일을 DB에 수작업으로 적재할 때는 schema.sql에 포함된 쿼리를 참조하십시오.
+> `-l` 을 생략하면 외부 타입 바인딩이 해석되지 않아 callee 클래스명이 부정확해질 수 있다(미해석 타입은 현재 패키지 기준으로
+> 추정되거나 `<unresolved>` 로 기록된다). 정확한 Call Graph 가 필요하면 컴파일에 쓰는 의존 Jar 디렉터리를 반드시 지정한다.
 
-  MySQL 예시
+## 3. 산출물
 
-   1 -- 데이터 적재 순서 주의 (FK 제약 조건)
-   2 -- project -> file -> class -> method -> call_graph 순으로 진행
-   3 LOAD DATA INFILE '/path/to/method_metric.csv'
-   4 INTO TABLE method_metric
-   5 FIELDS TERMINATED BY ','
-   6 ENCLOSED BY '"'
-   7 IGNORE 1 LINES;
+| 파일 | 테이블 | PK |
+|---|---|---|
+| `project.csv` | project | project_id |
+| `file_metric.csv` | file_metric | file_id |
+| `class_metric.csv` | class_metric | class_id |
+| `method_metric.csv` | method_metric | method_id |
+| `call_graph.csv` | call_graph | (caller_method_id, call_seq) |
 
-  PostgreSQL 예시
+CSV 포맷: UTF-8, 콤마 구분, 헤더 포함, LF 개행, 값에 콤마/개행/따옴표가 있을 때만 큰따옴표로 감싸고 내부 따옴표는 이중화(RFC4180).
+`callee_method_id` 가 NULL 인 행은 따옴표 없는 빈 값으로 기록된다.
 
-   1 psql -d my_database -c "\copy method_metric FROM 'method_metric.csv' WITH (FORMAT csv, HEADER true, QUOTE '\"')"
+DDL 과 적재 쿼리는 `sql/` 에 있다.
 
-  ---
+| 파일 | 내용 |
+|---|---|
+| `sql/schema.sql` | MySQL 8.x DDL |
+| `sql/schema_postgresql.sql` | PostgreSQL 13+ DDL |
+| `sql/bulk_import.sql` | MySQL `LOAD DATA` / PostgreSQL `COPY` 예시 |
 
-  5. 주요 분석 로직 팁
-   * 복잡도(Cyclomatic Complexity): 메서드 내의 조건문, 반복문, 논리 연산자(&&, ||)를 추적하여 계산합니다.
-   * 가중 복잡도(Weighted Complexity): 단순 로직 복잡도에 외부 영향도(Fan-in/out)를 더해 산출하므로, 리팩토링이 시급한
-     "God Method"를 찾기에 적합합니다.
-   * Call Graph: 라이브러리 호출은 callee_target_type = 'LIBRARY'로 표시되어 내부 로직 분석 시 필터링할 수 있습니다.
+적재 순서는 FK 때문에 `project → file_metric → class_metric → method_metric → call_graph` 를 지켜야 한다.
+
+## 4. 식별자 체계
+
+| 항목 | 규칙 | 예시 |
+|---|---|---|
+| project_id | CLI `-p` 값 | `my-app` |
+| file_id | `패키지명 + . + 파일명` | `com.home.service.UserService.java` |
+| class_id | Full Qualified Class Name (중첩 클래스는 `Outer.Inner`) | `com.home.service.UserService` |
+| method_id | `FQCN.메서드명(파라미터타입,...)` (제네릭 소거 기준 풀 타입명) | `com.home.service.UserService.createUser(java.lang.String,int)` |
+| call_graph PK | `(caller_method_id, call_seq)` — call_seq 는 caller 내부 등장 순번 1부터 | |
+
+`method_metric.signature` 는 `method_id` 와 같은 풀 시그니처 문자열이다. 후처리에서
+`call_graph.callee_raw_signature` 와 문자열 동등 비교로 `callee_method_id` 를 연결하기 때문에 두 값의 생성 규칙을 동일하게 맞췄다.
+
+## 5. 패키지 필터 (PackageFilter)
+
+평가 우선순위
+
+1. `-e` prefix 에 걸리면 무조건 제외
+2. 기본 스킵 prefix (`java.`, `javax.`, `jakarta.`, `sun.`, `com.sun.`, `jdk.`, `org.springframework.`) 는 옵션과 무관하게 제외
+3. `-i` 가 지정되면 해당 prefix 로 시작하는 callee 만 수집
+4. `-i` 가 비어 있으면 1~2 를 제외한 전체 통과
+
+필터는 **callee 클래스** 판정에만 쓰인다. 분석 대상 파일 수집은 `-s` 하위 전체 `.java` 다.
+
+## 6. 계산 규칙
+
+- **Cyclomatic Complexity**: `If, For, EnhancedFor, While, Do, Catch, Conditional(?:), SwitchCase(default 제외)` 개수 + 1
+- **Fan-in**: 해당 method_id 가 `callee_method_id` 로 참조된 횟수
+- **Fan-out**: 해당 method_id 가 `caller_method_id` 로 다른 메서드를 호출한 횟수
+- **Weighted Complexity**: `round(cyclomatic_complexity + fan_in * 1.5 + fan_out * 1.0)`
+- **class_metric**: 클래스 내 메서드 복잡도의 Total / Max / Avg(소수 2자리 반올림)
+- **file_metric**: `total_lines` 전체 줄 수, `code_loc` 코드가 있는 줄, `comment_loc` 주석이 있는 줄
+  (코드와 주석이 같은 줄에 있으면 양쪽 모두 계수, 빈 줄은 어느 쪽도 아님)
+- **project.total_loc**: 전체 파일 `code_loc` 합계
+
+### callee_target_type 판정
+
+| 값 | 조건 |
+|---|---|
+| `INTERNAL` | `callee_raw_signature` 가 수집된 `method_metric.signature` 와 일치 |
+| `EXTERNAL_PROJECT` | 매칭 실패 + (소스 기반 타입이거나, 수집된 class_id 이거나, `-i` prefix 매칭) |
+| `LIBRARY` | 그 외 (바이너리 라이브러리 호출) |
+
+## 7. 수집 범위 제약
+
+- 호출 수집 노드: `MethodInvocation`, `SuperMethodInvocation`, `ClassInstanceCreation`.
+  `this(...)` / `super(...)` 생성자 위임 호출은 수집하지 않는다.
+- 익명/로컬 클래스의 메서드는 별도 `method_metric` 행으로 만들지 않고, 그 내부 호출을 바깥 named 메서드의 호출로 귀속시킨다.
+- 필드 초기화식 / static 초기화 블록 안의 호출은 caller 메서드가 없으므로 수집하지 않는다.
+- 묵시적(선언되지 않은) 기본 생성자는 `method_metric` 에 없으므로, 그 생성자 호출은 `EXTERNAL_PROJECT` 로 분류된다.
+
+## 8. 자체 검증 결과
+
+이 도구로 자기 자신(`src/main/java`)을 분석했을 때: files 24 / classes 26 / methods 84 / calls 204,
+call_graph PK 유일성·call_seq 연속성·FK 정합성·fan_in/fan_out/weighted 재계산 일치 확인.

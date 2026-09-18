@@ -1,209 +1,281 @@
 package io.cscope.java.parser;
 
-import io.cscope.java.config.PackageFilter;
-import io.cscope.java.dto.*;
-import io.cscope.java.util.LineNumberUtils;
-import io.cscope.java.util.SourceIdBuilder;
-import org.eclipse.jdt.core.dom.*;
-
-import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 
+import org.eclipse.jdt.core.dom.ASTNode;
+import org.eclipse.jdt.core.dom.ASTVisitor;
+import org.eclipse.jdt.core.dom.AbstractTypeDeclaration;
+import org.eclipse.jdt.core.dom.AnnotationTypeDeclaration;
+import org.eclipse.jdt.core.dom.ClassInstanceCreation;
+import org.eclipse.jdt.core.dom.CompilationUnit;
+import org.eclipse.jdt.core.dom.EnumDeclaration;
+import org.eclipse.jdt.core.dom.IMethodBinding;
+import org.eclipse.jdt.core.dom.ITypeBinding;
+import org.eclipse.jdt.core.dom.MethodDeclaration;
+import org.eclipse.jdt.core.dom.MethodInvocation;
+import org.eclipse.jdt.core.dom.Modifier;
+import org.eclipse.jdt.core.dom.RecordDeclaration;
+import org.eclipse.jdt.core.dom.SuperMethodInvocation;
+import org.eclipse.jdt.core.dom.TypeDeclaration;
+
+import io.cscope.java.config.PackageFilter;
+import io.cscope.java.dto.AnalysisResult;
+import io.cscope.java.dto.CallEdge;
+import io.cscope.java.dto.ClassMetric;
+import io.cscope.java.dto.ClassType;
+import io.cscope.java.dto.FileMetric;
+import io.cscope.java.dto.MethodMetric;
+import io.cscope.java.util.SourceIdBuilder;
+
+/**
+ * CompilationUnit 1개에서 class / method / call 정보를 수집한다.
+ *
+ * <p>수집 규칙
+ * <ul>
+ *   <li>익명/로컬 클래스의 메서드는 별도 method_metric 으로 만들지 않고, 그 안의 호출을 바깥(named) 메서드에 귀속시킨다.</li>
+ *   <li>필드 초기화식/static 블록 안의 호출은 caller 메서드가 없으므로 수집하지 않는다.</li>
+ *   <li>호출 수집 대상 노드: MethodInvocation, SuperMethodInvocation, ClassInstanceCreation</li>
+ * </ul>
+ */
 public class ExtendedJdtMetricsVisitor extends ASTVisitor {
+
+    private final CompilationUnit compilationUnit;
+    private final PackageFilter filter;
+    private final AnalysisResult result;
     private final String projectId;
-    private final String filePath;
-    private final String source;
-    private final PackageFilter packageFilter;
-    private CompilationUnit cu;
-    
-    private final FileMetricDto fileMetric;
-    private final List<ClassMetricDto> classMetrics = new ArrayList<>();
-    private final List<MethodMetricDto> methodMetrics = new ArrayList<>();
-    private final List<CallGraphDto> callGraphs = new ArrayList<>();
+    private final String filePackageName;
+    private final String fileId;
+    private final Deque<MethodContext> callerStack = new ArrayDeque<>();
 
-    private TypeDeclaration currentClass;
-    private MethodDeclaration currentMethod;
-    private int callSeq = 0;
-
-    public ExtendedJdtMetricsVisitor(String projectId, String filePath, String source, PackageFilter packageFilter) {
-        this.projectId = projectId;
-        this.filePath = filePath;
-        this.source = source;
-        this.packageFilter = packageFilter;
-        
-        // Initialize file metric with placeholder
-        this.fileMetric = new FileMetricDto(null, projectId);
-        this.fileMetric.filePath = filePath;
+    public ExtendedJdtMetricsVisitor(CompilationUnit compilationUnit, FileMetric fileMetric,
+            PackageFilter filter, AnalysisResult result) {
+        this.compilationUnit = compilationUnit;
+        this.filter = filter;
+        this.result = result;
+        this.projectId = fileMetric.projectId;
+        this.filePackageName = fileMetric.packageName;
+        this.fileId = fileMetric.fileId;
     }
 
-    @Override
-    public boolean visit(CompilationUnit node) {
-        this.cu = node;
-        PackageDeclaration pkg = node.getPackage();
-        String packageName = (pkg != null) ? pkg.getName().getFullyQualifiedName() : "";
-        
-        if (!packageFilter.shouldAnalyze(packageName)) {
-            return false;
-        }
-
-        String fileName = filePath.substring(filePath.lastIndexOf("\\") + 1);
-        if (fileName.contains("/")) fileName = filePath.substring(filePath.lastIndexOf("/") + 1);
-        
-        fileMetric.fileId = SourceIdBuilder.buildFileId(packageName, fileName);
-        fileMetric.packageName = packageName;
-        fileMetric.fileName = fileName;
-        fileMetric.totalLines = cu.getLineNumber(source.length());
-        fileMetric.codeLoc = LineNumberUtils.calculateLoc(source, 0, source.length());
-        
-        // JDT provides comments separately
-        fileMetric.commentLoc = node.getCommentList().size(); // Rough estimate
-        
-        return true;
-    }
+    // ---------------------------------------------------------------- 타입
 
     @Override
     public boolean visit(TypeDeclaration node) {
-        ITypeBinding binding = node.resolveBinding();
-        if (binding == null) return true;
-
-        currentClass = node;
-
-        String className = node.getName().getIdentifier();
-        String fullClassName = binding.getBinaryName();
-        if (fullClassName == null) fullClassName = binding.getQualifiedName();
-
-        ClassMetricDto classDto = new ClassMetricDto(
-                SourceIdBuilder.buildClassId(fileMetric.packageName, fullClassName),
-                projectId,
-                fileMetric.fileId
-        );
-        classDto.packageName = fileMetric.packageName;
-        classDto.className = className;
-        classDto.fullClassName = fullClassName;
-        classDto.classType = node.isInterface() ? "INTERFACE" : (Modifier.isAbstract(node.getModifiers()) ? "ABSTRACT_CLASS" : "CLASS");
-        classDto.startLine = LineNumberUtils.getStartLine(cu, node);
-        classDto.endLine = LineNumberUtils.getEndLine(cu, node);
-        classDto.loc = LineNumberUtils.calculateLoc(source, node.getStartPosition(), node.getLength());
-
-        classMetrics.add(classDto);
-        fileMetric.classCount++;
-
+        ClassType classType;
+        if (node.isInterface()) {
+            classType = ClassType.INTERFACE;
+        } else if (Modifier.isAbstract(node.getModifiers())) {
+            classType = ClassType.ABSTRACT_CLASS;
+        } else {
+            classType = ClassType.CLASS;
+        }
+        addClass(node, node.getName().getIdentifier(), node.resolveBinding(), classType);
         return true;
-    }
-
-    @Override
-    public void endVisit(TypeDeclaration node) {
-        // Pop class if nested
-        // This logic might need refinement for nested classes
     }
 
     @Override
     public boolean visit(EnumDeclaration node) {
-        ITypeBinding binding = node.resolveBinding();
-        if (binding == null) return true;
-
-        ClassMetricDto classDto = new ClassMetricDto(
-                SourceIdBuilder.buildClassId(fileMetric.packageName, binding.getQualifiedName()),
-                projectId,
-                fileMetric.fileId
-        );
-        classDto.packageName = fileMetric.packageName;
-        classDto.className = node.getName().getIdentifier();
-        classDto.fullClassName = binding.getQualifiedName();
-        classDto.classType = "ENUM";
-        classDto.startLine = LineNumberUtils.getStartLine(cu, node);
-        classDto.endLine = LineNumberUtils.getEndLine(cu, node);
-        classDto.loc = LineNumberUtils.calculateLoc(source, node.getStartPosition(), node.getLength());
-
-        classMetrics.add(classDto);
-        fileMetric.classCount++;
+        addClass(node, node.getName().getIdentifier(), node.resolveBinding(), ClassType.ENUM);
         return true;
     }
+
+    @Override
+    public boolean visit(AnnotationTypeDeclaration node) {
+        addClass(node, node.getName().getIdentifier(), node.resolveBinding(), ClassType.INTERFACE);
+        return true;
+    }
+
+    @Override
+    public boolean visit(RecordDeclaration node) {
+        addClass(node, node.getName().getIdentifier(), node.resolveBinding(), ClassType.CLASS);
+        return true;
+    }
+
+    private void addClass(ASTNode node, String simpleName, ITypeBinding binding, ClassType classType) {
+        String fullClassName = binding != null
+                ? SourceIdBuilder.typeName(binding)
+                : SourceIdBuilder.classId(enclosingTypePrefix(node), simpleName);
+
+        ClassMetric metric = new ClassMetric();
+        metric.classId = fullClassName;
+        metric.projectId = projectId;
+        metric.fileId = fileId;
+        metric.packageName = packageNameOf(binding);
+        metric.className = simpleName;
+        metric.fullClassName = fullClassName;
+        metric.classType = classType;
+        metric.startLine = lineOf(node.getStartPosition());
+        metric.endLine = lineOf(node.getStartPosition() + node.getLength() - 1);
+        metric.loc = metric.endLine - metric.startLine + 1;
+        result.classes.add(metric);
+    }
+
+    // -------------------------------------------------------------- 메서드
 
     @Override
     public boolean visit(MethodDeclaration node) {
         IMethodBinding binding = node.resolveBinding();
-        if (binding == null) return true;
-
-        currentMethod = node;
-        callSeq = 0;
-
-        String methodName = node.getName().getIdentifier();
-        String signature = buildSignature(binding);
-        String classId = SourceIdBuilder.buildClassId(fileMetric.packageName, binding.getDeclaringClass().getQualifiedName());
-        String methodId = SourceIdBuilder.buildMethodId(classId, methodName, signature);
-
-        MethodMetricDto methodDto = new MethodMetricDto(methodId, projectId, classId);
-        methodDto.packageName = fileMetric.packageName;
-        methodDto.className = binding.getDeclaringClass().getName();
-        methodDto.methodName = methodName;
-        methodDto.signature = signature;
-        methodDto.startLine = LineNumberUtils.getStartLine(cu, node);
-        methodDto.endLine = LineNumberUtils.getEndLine(cu, node);
-        methodDto.loc = LineNumberUtils.calculateLoc(source, node.getStartPosition(), node.getLength());
-
-        // Complexity
-        CyclomaticComplexityVisitor ccVisitor = new CyclomaticComplexityVisitor();
-        node.accept(ccVisitor);
-        methodDto.cyclomaticComplexity = ccVisitor.getComplexity();
-
-        methodMetrics.add(methodDto);
-        fileMetric.methodCount++;
-        
-        // Update class method count
-        for (ClassMetricDto c : classMetrics) {
-            if (c.classId.equals(classId)) {
-                c.methodCount++;
-                break;
-            }
+        ITypeBinding declaringClass = binding != null ? binding.getDeclaringClass() : null;
+        if (declaringClass != null && (declaringClass.isAnonymous() || declaringClass.isLocal())) {
+            // 익명/로컬 클래스 메서드: 호출은 바깥 메서드에 귀속시킨다.
+            return true;
         }
 
+        String fullClassName = declaringClass != null
+                ? SourceIdBuilder.typeName(declaringClass)
+                : enclosingTypeName(node);
+        List<String> parameterTypes = binding != null
+                ? SourceIdBuilder.parameterTypeNames(binding)
+                : SourceIdBuilder.parameterTypeNames(node);
+        String methodName = node.getName().getIdentifier();
+        String methodId = SourceIdBuilder.methodId(fullClassName, methodName, parameterTypes);
+
+        MethodMetric metric = new MethodMetric();
+        metric.methodId = methodId;
+        metric.projectId = projectId;
+        metric.classId = fullClassName;
+        metric.packageName = declaringClass != null ? packageNameOf(declaringClass) : filePackageName;
+        metric.className = declaringClass != null ? declaringClass.getName() : simpleNameOf(fullClassName);
+        metric.methodName = methodName;
+        metric.signature = methodId;
+        metric.startLine = lineOf(node.getStartPosition());
+        metric.endLine = lineOf(node.getStartPosition() + node.getLength() - 1);
+        metric.loc = metric.endLine - metric.startLine + 1;
+        metric.cyclomaticComplexity = CyclomaticComplexityVisitor.compute(node);
+        result.methods.add(metric);
+
+        callerStack.push(new MethodContext(node, methodId));
         return true;
     }
 
     @Override
-    public boolean visit(MethodInvocation node) {
-        if (currentMethod == null) return true;
-
-        IMethodBinding callerBinding = currentMethod.resolveBinding();
-        if (callerBinding == null) return true;
-
-        IMethodBinding calleeBinding = node.resolveMethodBinding();
-        
-        String callerClassId = SourceIdBuilder.buildClassId(fileMetric.packageName, callerBinding.getDeclaringClass().getQualifiedName());
-        String callerMethodId = SourceIdBuilder.buildMethodId(callerClassId, currentMethod.getName().getIdentifier(), buildSignature(callerBinding));
-
-        callSeq++;
-        CallGraphDto callDto = new CallGraphDto(callerMethodId, callSeq, projectId);
-        callDto.callLine = cu.getLineNumber(node.getStartPosition());
-
-        if (calleeBinding != null) {
-            callDto.calleeClassName = calleeBinding.getDeclaringClass().getQualifiedName();
-            callDto.calleeMethodName = calleeBinding.getName();
-            callDto.calleeRawSignature = buildSignature(calleeBinding);
-        } else {
-            // Fallback if binding fails
-            callDto.calleeMethodName = node.getName().getIdentifier();
-            callDto.calleeRawSignature = "()"; // Unknown
+    public void endVisit(MethodDeclaration node) {
+        MethodContext current = callerStack.peek();
+        if (current != null && current.node == node) {
+            callerStack.pop();
         }
+    }
 
-        callGraphs.add(callDto);
+    // ---------------------------------------------------------------- 호출
+
+    @Override
+    public boolean visit(MethodInvocation node) {
+        recordCall(node, node.resolveMethodBinding(), node.getName().getIdentifier(), node.arguments().size());
         return true;
     }
 
-    private String buildSignature(IMethodBinding binding) {
-        StringBuilder sb = new StringBuilder("(");
-        ITypeBinding[] params = binding.getParameterTypes();
-        for (int i = 0; i < params.length; i++) {
-            sb.append(params[i].getQualifiedName());
-            if (i < params.length - 1) sb.append(",");
-        }
-        sb.append(")");
-        return sb.toString();
+    @Override
+    public boolean visit(SuperMethodInvocation node) {
+        recordCall(node, node.resolveMethodBinding(), node.getName().getIdentifier(), node.arguments().size());
+        return true;
     }
 
-    public FileMetricDto getFileMetric() { return fileMetric; }
-    public List<ClassMetricDto> getClassMetrics() { return classMetrics; }
-    public List<MethodMetricDto> getMethodMetrics() { return methodMetrics; }
-    public List<CallGraphDto> getCallGraphs() { return callGraphs; }
+    @Override
+    public boolean visit(ClassInstanceCreation node) {
+        IMethodBinding binding = node.resolveConstructorBinding();
+        String fallbackName = binding != null ? binding.getName() : node.getType().toString();
+        recordCall(node, binding, fallbackName, node.arguments().size());
+        return true;
+    }
+
+    private void recordCall(ASTNode node, IMethodBinding binding, String fallbackName, int argumentCount) {
+        MethodContext caller = callerStack.peek();
+        if (caller == null) {
+            return; // 필드 초기화식 / static 블록 등 caller 메서드가 없는 호출
+        }
+
+        String calleeClassName;
+        String calleeMethodName;
+        String calleeRawSignature;
+        boolean fromSource = false;
+
+        if (binding != null) {
+            IMethodBinding declaration = binding.getMethodDeclaration();
+            ITypeBinding declaringClass = declaration.getDeclaringClass();
+            calleeClassName = SourceIdBuilder.typeName(declaringClass);
+            calleeMethodName = declaration.getName();
+            calleeRawSignature = SourceIdBuilder.methodId(calleeClassName, calleeMethodName,
+                    SourceIdBuilder.parameterTypeNames(declaration));
+            fromSource = declaringClass != null && declaringClass.isFromSource();
+        } else {
+            calleeClassName = SourceIdBuilder.UNRESOLVED_CLASS;
+            calleeMethodName = fallbackName;
+            calleeRawSignature = SourceIdBuilder.methodId(calleeClassName, calleeMethodName,
+                    SourceIdBuilder.unknownParameterTypes(argumentCount));
+        }
+
+        if (!filter.isCollectable(calleeClassName)) {
+            return;
+        }
+
+        CallEdge edge = new CallEdge();
+        edge.callerMethodId = caller.methodId;
+        edge.callSeq = ++caller.callSeq;
+        edge.projectId = projectId;
+        edge.calleeClassName = calleeClassName;
+        edge.calleeMethodName = calleeMethodName;
+        edge.calleeRawSignature = calleeRawSignature;
+        edge.calleeFromSource = fromSource;
+        edge.callLine = lineOf(node.getStartPosition());
+        result.calls.add(edge);
+    }
+
+    // ---------------------------------------------------------------- 보조
+
+    private int lineOf(int position) {
+        int line = compilationUnit.getLineNumber(position);
+        return line > 0 ? line : 0;
+    }
+
+    private String packageNameOf(ITypeBinding binding) {
+        if (binding == null || binding.getPackage() == null) {
+            return filePackageName;
+        }
+        return binding.getPackage().getName();
+    }
+
+    /** 바인딩 실패 시 AST 부모를 거슬러 올라가 만든 풀 클래스명. */
+    private String enclosingTypeName(ASTNode node) {
+        ASTNode parent = node.getParent();
+        while (parent != null && !(parent instanceof AbstractTypeDeclaration)) {
+            parent = parent.getParent();
+        }
+        if (parent == null) {
+            return SourceIdBuilder.classId(filePackageName, SourceIdBuilder.UNRESOLVED_CLASS);
+        }
+        AbstractTypeDeclaration type = (AbstractTypeDeclaration) parent;
+        return SourceIdBuilder.classId(enclosingTypePrefix(type), type.getName().getIdentifier());
+    }
+
+    /** 중첩 타입이면 바깥 타입명까지 포함한 prefix, 아니면 패키지명. */
+    private String enclosingTypePrefix(ASTNode node) {
+        ASTNode parent = node.getParent();
+        while (parent != null && !(parent instanceof AbstractTypeDeclaration)) {
+            parent = parent.getParent();
+        }
+        if (parent == null) {
+            return filePackageName;
+        }
+        AbstractTypeDeclaration outer = (AbstractTypeDeclaration) parent;
+        return SourceIdBuilder.classId(enclosingTypePrefix(outer), outer.getName().getIdentifier());
+    }
+
+    private static String simpleNameOf(String fullClassName) {
+        int index = fullClassName.lastIndexOf('.');
+        return index < 0 ? fullClassName : fullClassName.substring(index + 1);
+    }
+
+    /** caller 메서드 컨텍스트. call_seq 는 메서드별 1부터 증가. */
+    private static final class MethodContext {
+        private final ASTNode node;
+        private final String methodId;
+        private int callSeq;
+
+        private MethodContext(ASTNode node, String methodId) {
+            this.node = node;
+            this.methodId = methodId;
+        }
+    }
 }

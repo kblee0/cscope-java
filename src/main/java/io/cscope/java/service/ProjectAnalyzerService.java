@@ -1,99 +1,99 @@
 package io.cscope.java.service;
 
-import io.cscope.java.config.AnalyzerConfig;
-import io.cscope.java.config.PackageFilter;
-import io.cscope.java.dto.*;
-import io.cscope.java.parser.ExtendedJdtMetricsVisitor;
-import io.cscope.java.parser.JdtParserFactory;
-import org.eclipse.jdt.core.dom.ASTParser;
-import org.eclipse.jdt.core.dom.CompilationUnit;
-
-import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
-import java.util.ArrayList;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
+import org.eclipse.jdt.core.dom.ASTParser;
+import org.eclipse.jdt.core.dom.CompilationUnit;
+import org.eclipse.jdt.core.dom.FileASTRequestor;
+
+import io.cscope.java.config.AnalyzerConfig;
+import io.cscope.java.dto.AnalysisResult;
+import io.cscope.java.dto.FileMetric;
+import io.cscope.java.dto.ProjectMetric;
+import io.cscope.java.parser.ExtendedJdtMetricsVisitor;
+import io.cscope.java.parser.JdtParserFactory;
+import io.cscope.java.util.FileScanner;
+import io.cscope.java.util.LineNumberUtils;
+import io.cscope.java.util.SourceIdBuilder;
+
+/** 파싱 → 인메모리 후처리 오케스트레이션. */
 public class ProjectAnalyzerService {
-    private final CallGraphResolver callGraphResolver = new CallGraphResolver();
-    private final MetricAggregator metricAggregator = new MetricAggregator();
 
-    public void analyze(AnalyzerConfig config, List<FileMetricDto> fileMetrics, List<ClassMetricDto> classMetrics, List<MethodMetricDto> methodMetrics, List<CallGraphDto> callGraphs) throws IOException {
-        PackageFilter filter = new PackageFilter(config.includePackages, config.excludePackages);
-        
-        List<File> javaFiles = findJavaFiles(new File(config.sourcePath));
-        String[] sourcePaths = { config.sourcePath };
-        
-        // Build Classpath including external JARs (Supports multiple paths separated by ; or :)
-        List<String> classpathList = new ArrayList<>();
-        if (config.libPath != null) {
-            String[] entries = config.libPath.split(File.pathSeparator);
-            for (String entry : entries) {
-                File file = new File(entry.trim());
-                if (file.exists()) {
-                    if (file.isDirectory()) {
-                        // Add the directory itself (for .class files)
-                        classpathList.add(file.getAbsolutePath());
-                        // Also add all .jar files inside
-                        File[] jars = file.listFiles((dir, name) -> name.endsWith(".jar"));
-                        if (jars != null) {
-                            for (File jar : jars) classpathList.add(jar.getAbsolutePath());
-                        }
-                    } else if (file.getName().endsWith(".jar")) {
-                        classpathList.add(file.getAbsolutePath());
-                    }
+    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    public AnalysisResult analyze(AnalyzerConfig config) throws IOException {
+        List<Path> sourceFiles = FileScanner.findJavaFiles(config.getSourceRoot());
+        if (sourceFiles.isEmpty()) {
+            throw new IllegalArgumentException("분석할 .java 파일이 없습니다: " + config.getSourceRoot());
+        }
+
+        AnalysisResult result = new AnalysisResult();
+        result.project = newProjectMetric(config);
+
+        // 1차 파싱: 전체 파일을 한 번에 넘겨야 파일 간 바인딩이 해석된다.
+        String[] paths = sourceFiles.stream()
+                .map(path -> path.toAbsolutePath().toString())
+                .toArray(String[]::new);
+
+        ASTParser parser = JdtParserFactory.newParser(config);
+        parser.createASTs(paths, null, new String[0], new FileASTRequestor() {
+            @Override
+            public void acceptAST(String sourceFilePath, CompilationUnit ast) {
+                try {
+                    processUnit(config, result, Paths.get(sourceFilePath), ast);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("소스 파일 읽기 실패: " + sourceFilePath, e);
                 }
             }
-        }
-        // Include system classpath
-        classpathList.add(System.getProperty("java.class.path"));
-        String[] classpath = classpathList.toArray(new String[0]);
+        }, null);
 
-        ASTParser parser = JdtParserFactory.createParser(classpath, sourcePaths);
-
-        for (File file : javaFiles) {
-            String source = Files.readString(file.toPath());
-            parser.setSource(source.toCharArray());
-            parser.setUnitName(file.getName());
-            
-            CompilationUnit cu = (CompilationUnit) parser.createAST(null);
-            ExtendedJdtMetricsVisitor visitor = new ExtendedJdtMetricsVisitor(config.projectId, file.getAbsolutePath(), source, filter);
-            cu.accept(visitor);
-
-            if (visitor.getFileMetric().fileId != null) {
-                fileMetrics.add(visitor.getFileMetric());
-                classMetrics.addAll(visitor.getClassMetrics());
-                methodMetrics.addAll(visitor.getMethodMetrics());
-                callGraphs.addAll(visitor.getCallGraphs());
-            }
-        }
-
-        // Post-processing
-        callGraphResolver.resolve(callGraphs, methodMetrics, filter);
-        metricAggregator.aggregate(classMetrics, methodMetrics, callGraphs);
-    }
-
-    private List<File> findJavaFiles(File dir) {
-        List<File> result = new ArrayList<>();
-        File[] files = dir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                if (f.isDirectory()) {
-                    result.addAll(findJavaFiles(f));
-                } else if (f.getName().endsWith(".java")) {
-                    result.add(f);
-                }
-            }
-        }
+        // 2차 인메모리 후처리
+        CallGraphResolver.resolve(result, config.getPackageFilter());
+        MetricAggregator.aggregate(result);
         return result;
     }
 
-    public ProjectDto summarize(AnalyzerConfig config, List<FileMetricDto> fileMetrics, List<ClassMetricDto> classMetrics, List<MethodMetricDto> methodMetrics) {
-        ProjectDto project = new ProjectDto(config.projectId, config.projectId, config.sourcePath);
-        project.totalFiles = fileMetrics.size();
-        project.totalLoc = fileMetrics.stream().mapToInt(f -> f.codeLoc).sum();
-        project.totalClasses = classMetrics.size();
-        project.totalMethods = methodMetrics.size();
+    private void processUnit(AnalyzerConfig config, AnalysisResult result, Path file, CompilationUnit unit)
+            throws IOException {
+        String source = new String(Files.readAllBytes(file), config.getCharset());
+        LineNumberUtils.LineCounts counts = LineNumberUtils.count(source);
+
+        String packageName = unit.getPackage() != null
+                ? unit.getPackage().getName().getFullyQualifiedName()
+                : "";
+        String fileName = file.getFileName().toString();
+
+        FileMetric fileMetric = new FileMetric();
+        fileMetric.fileId = SourceIdBuilder.fileId(packageName, fileName);
+        fileMetric.projectId = config.getProjectId();
+        fileMetric.packageName = packageName;
+        fileMetric.fileName = fileName;
+        fileMetric.filePath = relativePath(config.getSourceRoot(), file);
+        fileMetric.totalLines = counts.totalLines;
+        fileMetric.codeLoc = counts.codeLoc;
+        fileMetric.commentLoc = counts.commentLoc;
+        result.files.add(fileMetric);
+
+        unit.accept(new ExtendedJdtMetricsVisitor(unit, fileMetric, config.getPackageFilter(), result));
+    }
+
+    private static String relativePath(Path sourceRoot, Path file) {
+        return sourceRoot.relativize(file.toAbsolutePath().normalize()).toString().replace('\\', '/');
+    }
+
+    private static ProjectMetric newProjectMetric(AnalyzerConfig config) {
+        ProjectMetric project = new ProjectMetric();
+        project.projectId = config.getProjectId();
+        project.projectName = config.getProjectName();
+        project.analyzedAt = LocalDateTime.now().format(TIMESTAMP);
+        project.packagePath = config.getSourceRoot().toString().replace('\\', '/');
         return project;
     }
 }

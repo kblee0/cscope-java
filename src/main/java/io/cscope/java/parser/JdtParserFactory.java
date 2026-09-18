@@ -1,26 +1,34 @@
 package io.cscope.java.parser;
 
+import java.util.Map;
+
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.dom.AST;
 import org.eclipse.jdt.core.dom.ASTParser;
 
-import java.util.Map;
+import io.cscope.java.config.AnalyzerConfig;
 
-public class JdtParserFactory {
-    public static ASTParser createParser(String[] classpath, String[] sourcepath) {
+/** 바인딩 해석이 가능한 ASTParser 생성. */
+public final class JdtParserFactory {
+
+    private static final String COMPLIANCE = JavaCore.VERSION_17;
+
+    private JdtParserFactory() {
+    }
+
+    public static ASTParser newParser(AnalyzerConfig config) {
         ASTParser parser = ASTParser.newParser(AST.getJLSLatest());
-        parser.setResolveBindings(true);
         parser.setKind(ASTParser.K_COMPILATION_UNIT);
+        parser.setResolveBindings(true);
         parser.setBindingsRecovery(true);
         parser.setStatementsRecovery(true);
 
-        Map<String, String> options = JavaCore.getOptions();
-        JavaCore.setComplianceOptions(JavaCore.VERSION_17, options);
-        parser.setCompilerOptions(options);
+        Map<String, String> compilerOptions = JavaCore.getOptions();
+        JavaCore.setComplianceOptions(COMPLIANCE, compilerOptions);
+        parser.setCompilerOptions(compilerOptions);
 
-        // Environment for binding resolution
-        parser.setEnvironment(classpath, sourcepath, new String[]{"UTF-8"}, true);
-
+        // includeRunningVMBootclasspath = true : JDK 타입 바인딩 해석용
+        parser.setEnvironment(config.getClasspathEntries(), config.getSourcepathEntries(), null, true);
         return parser;
     }
 }

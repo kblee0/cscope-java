@@ -1,37 +1,34 @@
 plugins {
     id 'java'
-    id 'application'
 }
 
 group = 'io.cscope'
-version = '1.0-SNAPSHOT'
+version = '1.0.0'
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    // Eclipse JDT ASTParser
-    implementation 'org.eclipse.jdt:org.eclipse.jdt.core:3.39.0'
-    
-    // Apache Commons CSV for exporting
+    implementation 'org.eclipse.jdt:org.eclipse.jdt.core:3.36.0'
     implementation 'org.apache.commons:commons-csv:1.10.0'
-    
-    // CLI Argument Parsing (Optional, using custom parser as requested but common-cli is helpful)
-    implementation 'commons-cli:commons-cli:1.6.0'
-
-    testImplementation platform('org.junit:junit-bom:5.10.0')
-    testImplementation 'org.junit.jupiter:junit-jupiter'
-}
-
-application {
-    mainClass = 'io.cscope.java.JdtProjectAnalyzerMain'
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+    options.release = 17
 }
 
-test {
-    useJUnitPlatform()
+// 의존성을 모두 포함한 실행 가능 Fat Jar (build/libs/cscope-java.jar)
+jar {
+    archiveBaseName = 'cscope-java'
+    archiveVersion = ''
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'io.cscope.java.JdtProjectAnalyzerMain'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/*.EC'
 }
